@@ -2,7 +2,8 @@
 
 An interactive dashboard showing coverage and performance for the initial NPOC (Pluslife) training, by region. Pick a region from the dropdown and the whole page updates. **All regions** is the default view and shows the overall figures.
 
-**Live dashboard:** `https://YOUR-USERNAME.github.io/YOUR-REPOSITORY/`
+**Live dashboard:** `https://ntrllds.github.io/npoc-rollout-dashboard/`
+`
 
 ## Disclaimer
 
