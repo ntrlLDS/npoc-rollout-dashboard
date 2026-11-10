@@ -2,6 +2,10 @@
 """
 Build the NPOC initial-training dashboard (single self-contained HTML file).
 
+One region dropdown drives the whole page: coverage numbers, assessment
+averages, the pretest/posttest paired t-test and Hake's g. "All regions" is the
+default view and holds the overall (national) aggregates.
+
 Usage
 -----
     python build_npoc_dashboard.py path/to/training_monitoring.csv
@@ -14,8 +18,7 @@ The HTML contains ONLY aggregated numbers (counts, regional means, test
 statistics). Facility names, participant names, e-mails and row-level scores are
 never written to the output. After writing, the script scans the HTML for any
 facility / participant / e-mail value found in the CSV and aborts if one is
-present. Keep the CSV itself out of the repository (see .gitignore note in the
-chat reply).
+present. Keep the CSV itself out of the repository.
 
 Libraries: pandas, numpy, scipy (stats). Charts are Plotly figure specs
 (the same JSON `plotly.graph_objects` produces) rendered by plotly.js.
@@ -24,7 +27,6 @@ import argparse
 import datetime as dt
 import json
 import math
-import re
 import sys
 from pathlib import Path
 
@@ -38,8 +40,10 @@ from scipy import stats
 PLOTLYJS_CDN = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 MIN_N = 5                         # minimum paired records before a t-test is reported
 ZERO_PRETEST_IS_MISSING = True    # a pretest of exactly 0 is treated as "not taken"
+ALL = "All regions"
 REGION_ORDER = ["NCR", "CAR", "I", "II", "III", "IV", "MMRP", "V", "VI", "VII",
                 "VIII", "IX", "X", "XI", "XII", "XIII", "NIR", "BARMM"]
+NAMED_REGIONS = {"NCR", "CAR", "MMRP", "NIR", "BARMM"}   # shown without the word "Region"
 
 METRICS = [  # (short key, axis label, CSV column)
     ("pre", "Pretest", "PRETEST_PERCENT"),
@@ -75,22 +79,29 @@ def region_sort_key(r):
     return (REGION_ORDER.index(r), r) if r in REGION_ORDER else (len(REGION_ORDER), r)
 
 
+def pretty(name):
+    if name == ALL or name in NAMED_REGIONS:
+        return name
+    return f"Region {name}"
+
+
 def hake_category(g):
-    if g is None or (isinstance(g, float) and math.isnan(g)):
+    if g is None:
         return "n/a"
     return "high" if g >= 0.7 else "medium" if g >= 0.3 else "low"
 
 
+CAT_COLOR = {"high": TEAL, "medium": AMBER, "low": CORAL, "n/a": SLATE}
+
+
 def p_text(p):
-    if p is None or (isinstance(p, float) and math.isnan(p)):
+    if p is None:
         return "p = n/a"
     return "p &lt; 0.001" if p < 0.001 else f"p = {p:.3f}"
 
 
-def stars(p):
-    if p is None or (isinstance(p, float) and math.isnan(p)):
-        return ""
-    return "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else " (ns)"
+def share(a, b):
+    return 100 * a / b if b else 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -112,14 +123,10 @@ def load(path):
     return df, n_zero_pre
 
 
-# --------------------------------------------------------------------------- #
-# Section 1 + 3: coverage numbers
-# --------------------------------------------------------------------------- #
-def coverage(df):
+def check_helper_status(df):
+    """Cross-check the sheet's HELPER_STATUS against a recomputation from the raw status columns."""
     main = df[df["SELECTION"] == "MAIN"]
     alt = df[df["SELECTION"] == "ALTERNATE"]
-
-    # Cross-check the sheet's own HELPER_STATUS against a recomputation
     alt_trained_for = set(alt.loc[alt["OVERALL_STATUS"] == "TRAINED", "ALTERNATE_FOR"])
     recomputed = np.where(main["OVERALL_STATUS"] == "TRAINED", "MAIN TRAINED",
                           np.where(main["FACILITY"].isin(alt_trained_for), "ALTERNATE TRAINED", "NEITHER TRAINED"))
@@ -128,41 +135,9 @@ def coverage(df):
         print(f"WARNING: {mismatch} main rows where HELPER_STATUS differs from recomputed status "
               f"(using HELPER_STATUS).", file=sys.stderr)
 
-    regions = sorted(df["REGION"].unique(), key=region_sort_key)
-    cov = pd.DataFrame(index=regions)
-    cov["main_total"] = main.groupby("REGION").size()
-    cov["main_trained"] = main[main["HELPER_STATUS"] == "MAIN TRAINED"].groupby("REGION").size()
-    cov["alt_covered"] = main[main["HELPER_STATUS"] == "ALTERNATE TRAINED"].groupby("REGION").size()
-    cov["neither"] = main[main["HELPER_STATUS"] == "NEITHER TRAINED"].groupby("REGION").size()
-    cov["alt_total"] = alt.groupby("REGION").size()
-    cov = cov.fillna(0).astype(int)
-    cov["covered"] = cov["main_trained"] + cov["alt_covered"]
-    cov["pct"] = np.where(cov["main_total"] > 0, 100 * cov["covered"] / cov["main_total"].replace(0, np.nan), np.nan)
-
-    inc = df[df["OVERALL_STATUS"].str.startswith("NOT TRAINED FOR")].copy()
-    inc["kind"] = np.where(inc["OVERALL_STATUS"].str.contains("ONLINE"), "online", "f2f")
-    inc_ct = {(s, k): int(((inc["SELECTION"] == s) & (inc["kind"] == k)).sum())
-              for s in ("MAIN", "ALTERNATE") for k in ("online", "f2f")}
-
-    totals = dict(
-        main_total=int(len(main)),
-        main_trained=int((main["HELPER_STATUS"] == "MAIN TRAINED").sum()),
-        alt_covered=int((main["HELPER_STATUS"] == "ALTERNATE TRAINED").sum()),
-        neither=int((main["HELPER_STATUS"] == "NEITHER TRAINED").sum()),
-        alt_listed=int(len(alt)),
-        alt_trained=int((alt["OVERALL_STATUS"] == "TRAINED").sum()),
-        incomplete=int(len(inc)),
-        neither_incomplete=int(((main["HELPER_STATUS"] == "NEITHER TRAINED")
-                                & main["OVERALL_STATUS"].str.startswith("NOT TRAINED FOR")).sum()),
-        n_regions=len(regions),
-    )
-    totals["covered"] = totals["main_trained"] + totals["alt_covered"]
-    totals["pct"] = 100 * totals["covered"] / totals["main_total"]
-    return cov, totals, inc_ct, regions
-
 
 # --------------------------------------------------------------------------- #
-# Section 2: performance + pre/post statistics
+# Aggregates for one view (all regions, or one region)
 # --------------------------------------------------------------------------- #
 def paired_stats(sub):
     d = sub[["s_pre", "s_post"]].dropna()
@@ -171,8 +146,8 @@ def paired_stats(sub):
     if n == 0:
         return out
     pre, post = d["s_pre"].mean(), d["s_post"].mean()
-    out.update(pre=pre, post=post, diff=post - pre)
-    out["g"] = (post - pre) / (100 - pre) if pre < 100 else None      # Hake: group-average gain
+    out.update(pre=float(pre), post=float(post), diff=float(post - pre))
+    out["g"] = float((post - pre) / (100 - pre)) if pre < 100 else None      # Hake: group-average gain
     if n >= MIN_N:
         diff = d["s_post"] - d["s_pre"]
         sd = diff.std(ddof=1)
@@ -182,19 +157,86 @@ def paired_stats(sub):
     return out
 
 
-def performance(df, regions):
-    groups = {"All regions": df}
-    for r in regions:
-        groups[r] = df[df["REGION"] == r]
-    res = {}
-    for name, sub in groups.items():
-        m = {}
-        for key, _label, _col in METRICS:
-            s = sub["s_" + key].dropna()
-            m[key] = dict(mean=s.mean() if len(s) else None,
-                          sd=s.std(ddof=1) if len(s) > 1 else None, n=int(len(s)))
-        res[name] = dict(metrics=m, paired=paired_stats(sub))
-    return res
+def summarize(sub):
+    main = sub[sub["SELECTION"] == "MAIN"]
+    alt = sub[sub["SELECTION"] == "ALTERNATE"]
+    hs = main["HELPER_STATUS"]
+    c = dict(main_total=int(len(main)),
+             main_trained=int((hs == "MAIN TRAINED").sum()),
+             alt_covered=int((hs == "ALTERNATE TRAINED").sum()),
+             neither=int((hs == "NEITHER TRAINED").sum()),
+             alt_listed=int(len(alt)),
+             alt_trained=int((alt["OVERALL_STATUS"] == "TRAINED").sum()))
+    c["covered"] = c["main_trained"] + c["alt_covered"]
+    c["pct"] = share(c["covered"], c["main_total"])
+    inc = sub[sub["OVERALL_STATUS"].str.startswith("NOT TRAINED FOR")]
+    online = inc["OVERALL_STATUS"].str.contains("ONLINE")
+    c.update(incomplete=int(len(inc)), inc_online=int(online.sum()), inc_f2f=int((~online).sum()),
+             inc_main=int((inc["SELECTION"] == "MAIN").sum()), inc_alt=int((inc["SELECTION"] == "ALTERNATE").sum()),
+             neither_incomplete=int(((hs == "NEITHER TRAINED")
+                                     & main["OVERALL_STATUS"].str.startswith("NOT TRAINED FOR")).sum()))
+    metrics = {}
+    for key, _label, _col in METRICS:
+        s = sub["s_" + key].dropna()
+        metrics[key] = dict(mean=float(s.mean()) if len(s) else None,
+                            sd=float(s.std(ddof=1)) if len(s) > 1 else None, n=int(len(s)))
+    return dict(c=c, metrics=metrics, paired=paired_stats(sub))
+
+
+# --------------------------------------------------------------------------- #
+# HTML fragments for one view
+# --------------------------------------------------------------------------- #
+def kpi(num_, label, sub, color):
+    return (f'<div class="kpi" style="--c:{color}"><div class="num">{num_}</div>'
+            f'<div class="lbl">{label}</div><div class="sub">{sub}</div></div>')
+
+
+def kpis_html(name, s):
+    c = s["c"]
+    where = "across all regions" if name == ALL else f"in {pretty(name)}"
+    partial = f" ({c['neither_incomplete']} with partial training)" if c["neither_incomplete"] else ""
+    return "".join([
+        kpi(c["main_total"], "Main sites", f"Main sites {where}", SLATE),
+        kpi(c["covered"], "Sites trained (main + alternate)",
+            f"{c['pct']:.1f}% of main sites are covered", TEAL),
+        kpi(c["main_trained"], "Trained at the main site",
+            f"{share(c['main_trained'], c['main_total']):.1f}% of main sites", INK),
+        kpi(c["alt_covered"], "Covered by an alternate",
+            (f"{c['alt_trained']} of {c['alt_listed']} alternate sites trained" if c["alt_listed"]
+             else "No alternate sites listed"), BLUE),
+        kpi(c["neither"], "Neither trained", f"No trained main or alternate staff{partial}", CORAL),
+        kpi(c["incomplete"], "Incomplete training",
+            (f"{c['inc_online']} missing online, {c['inc_f2f']} missing face-to-face "
+             f"({c['inc_main']} main, {c['inc_alt']} alternate)" if c["incomplete"]
+             else "No participants with partial training"), AMBER),
+    ])
+
+
+def stats_html(name, s, t):
+    p, pa = s["paired"], t["paired"]
+    head = f"<h3>{pretty(name)}: pretest to posttest</h3>"
+    if p["n"] == 0:
+        return head + '<p class="desc">No paired pretest and posttest records.</p>'
+    g, cat = p["g"], hake_category(p["g"])
+    if g is None:
+        big = '<div class="big">n/a<span>Hake\'s g is not defined when the pretest mean is 100%</span></div>'
+    else:
+        compare = ""
+        if name != ALL and pa["g"] is not None:
+            compare = f' <em>All regions: {pa["g"]:.2f}</em>'
+        big = (f'<div class="big" style="--c:{CAT_COLOR[cat]}">{g:.2f}'
+               f"<span>Hake's normalized gain, {cat} gain.{compare}</span></div>")
+    if p["p"] is None:
+        ttest = f"Not reported (fewer than {MIN_N} paired records)"
+        dz = "n/a"
+    else:
+        ttest = f"t({p['df']}) = {p['t']:.2f}, {p_text(p['p'])}"
+        dz = f"{p['dz']:.2f}"
+    rows = [("Paired records", f"{p['n']}"), ("Mean pretest", f"{p['pre']:.1f}%"),
+            ("Mean posttest", f"{p['post']:.1f}%"), ("Mean gain", f"{p['diff']:+.1f} points"),
+            ("Paired t-test", ttest), ("Cohen's dz", dz)]
+    dl = "".join(f"<div><dt>{k}</dt><dd>{v}</dd></div>" for k, v in rows)
+    return head + big + f'<dl class="stats">{dl}</dl>'
 
 
 # --------------------------------------------------------------------------- #
@@ -208,241 +250,107 @@ def base_layout(**kw):
     return lay
 
 
-def fig_status_bar(t):
-    segs = [("Trained at main site", t["main_trained"], TEAL),
-            ("Covered by alternate site", t["alt_covered"], BLUE),
-            ("Neither trained", t["neither"], CORAL)]
-    data = [dict(type="bar", orientation="h", y=["Main sites"], x=[n], name=name, text=[str(n)],
-                 textposition="inside", insidetextanchor="middle",
-                 textfont=dict(color="white", size=18), marker=dict(color=c),
-                 hovertemplate=f"{name}<br>%{{x}} of {t['main_total']} main sites"
-                               f" ({100 * n / t['main_total']:.1f}%)<extra></extra>")
-            for name, n, c in segs]
-    layout = base_layout(barmode="stack", height=250, margin=dict(l=10, r=10, t=10, b=90),
-                         xaxis=dict(range=[0, t["main_total"]], showgrid=False, zeroline=False,
-                                    showticklabels=False),
-                         yaxis=dict(showticklabels=False, showgrid=False),
-                         legend=dict(orientation="h", x=0, y=-0.2, yanchor="top"), bargap=0.15)
-    return dict(data=data, layout=layout)
-
-
-def fig_incomplete(inc_ct):
-    cats = ["Missing online training", "Missing face-to-face training"]
-    data = []
-    for sel, label, color in (("MAIN", "Main sites", INK), ("ALTERNATE", "Alternate sites", AMBER)):
-        vals = [inc_ct[(sel, "online")], inc_ct[(sel, "f2f")]]
-        data.append(dict(type="bar", orientation="h", y=cats, x=vals, name=label,
-                         text=[str(v) if v else "" for v in vals], textposition="inside",
-                         insidetextanchor="middle", textfont=dict(color="white", size=15),
-                         marker=dict(color=color),
-                         hovertemplate=f"{label}<br>%{{y}}: %{{x}}<extra></extra>"))
-    layout = base_layout(barmode="stack", height=250, margin=dict(l=10, r=10, t=10, b=90),
-                         xaxis=dict(showgrid=True, gridcolor=GRID, zeroline=False, dtick=1, rangemode="tozero"),
-                         yaxis=dict(autorange="reversed", automargin=True),
-                         legend=dict(orientation="h", x=0, y=-0.3, yanchor="top"), bargap=0.35)
-    return dict(data=data, layout=layout)
-
-
-def panel_text(label, s):
-    head = f"<b>{label}: pretest to posttest</b>"
-    if s["n"] == 0:
-        return head + "<br><br>No paired pretest and posttest records."
-    lines = [head, "",
-             f"Paired records: <b>{s['n']}</b>",
-             f"Mean pretest: <b>{s['pre']:.1f}%</b>",
-             f"Mean posttest: <b>{s['post']:.1f}%</b>",
-             f"Mean gain: <b>{s['diff']:+.1f} points</b>", ""]
-    if s["p"] is None:
-        lines += [f"<b>Paired t-test</b>", f"Not reported (fewer than {MIN_N} paired records)"]
-    else:
-        lines += ["<b>Paired t-test</b>", f"t({s['df']}) = {s['t']:.2f}, {p_text(s['p'])}",
-                  f"Cohen's dz = {s['dz']:.2f}"]
-    lines += ["", "<b>Hake's normalized gain</b>"]
-    if s["g"] is None:
-        lines.append("Not defined (pretest mean is 100%)")
-    else:
-        lines.append(f"g = {s['g']:.2f} ({hake_category(s['g'])} gain)")
-    return "<br>".join(lines)
-
-
-def fig_explorer(perf, regions):
-    options = ["All regions"] + regions
-    labels = [m[1] for m in METRICS]
-    nat = perf["All regions"]["metrics"]
-    nat_vals = [num(nat[k]["mean"]) for k, _l, _c in METRICS]
-    data = [dict(type="bar", name="All regions (comparison)", x=labels, y=nat_vals,
-                 marker=dict(color="rgba(138,151,171,0.45)"), visible=False,
-                 hovertemplate="%{x}<br>All regions: %{y:.1f}%<extra></extra>")]
-    for opt in options:
-        m = perf[opt]["metrics"]
-        ys = [num(m[k]["mean"]) for k, _l, _c in METRICS]
-        data.append(dict(type="bar", name=opt, x=labels, y=ys,
-                         text=[f"{v:.1f}%" if v is not None else "" for v in ys],
-                         textposition="outside", cliponaxis=False, marker=dict(color=TEAL),
-                         customdata=[[m[k]["n"], num(m[k]["sd"])] for k, _l, _c in METRICS],
-                         hovertemplate="%{x}<br>Mean: %{y:.1f}%<br>n = %{customdata[0]}"
-                                       "<br>SD = %{customdata[1]:.1f}<extra>" + opt + "</extra>",
-                         visible=(opt == "All regions")))
-
-    def ann(opt):
-        return dict(xref="paper", yref="paper", x=0.64, y=0.97, xanchor="left", yanchor="top",
-                    align="left", showarrow=False, text=panel_text(opt, perf[opt]["paired"]),
-                    bgcolor="#F1F5F9", bordercolor=GRID, borderwidth=1, borderpad=16,
-                    font=dict(size=14, color=INK))
-
-    buttons = []
-    for i, opt in enumerate(options):
-        vis = [i != 0] + [j == i for j in range(len(options))]
-        buttons.append(dict(label=opt, method="update",
-                            args=[{"visible": vis}, {"annotations": [ann(opt)]}]))
+def fig_sites(name, s):
+    c = s["c"]
+    xs = ["Main sites", "Main sites<br>covered", "Alternate<br>sites"]
+    ys = [c["main_total"], c["covered"], c["alt_listed"]]
+    data = [dict(type="bar", x=xs, y=ys, marker=dict(color=[INK, TEAL, AMBER]),
+                 text=[str(v) for v in ys], textposition="outside", cliponaxis=False,
+                 textfont=dict(size=15), showlegend=False,
+                 hovertemplate="%{x}: %{y}<extra></extra>")]
     layout = base_layout(
-        height=470, barmode="group", bargap=0.35, bargroupgap=0.08,
-        margin=dict(l=60, r=24, t=80, b=100),
-        xaxis=dict(domain=[0, 0.58], showgrid=False, fixedrange=True),
-        yaxis=dict(range=[0, 112], ticksuffix="%", gridcolor=GRID, zeroline=False,
-                   title=dict(text="Mean score")),
-        legend=dict(orientation="h", x=0, y=-0.2, yanchor="top"),
-        annotations=[ann("All regions")],
-        updatemenus=[dict(type="dropdown", direction="down", active=0, x=0, xanchor="left",
-                          y=1.2, yanchor="top", buttons=buttons, bgcolor="white", bordercolor="#B8C2D0",
-                          font=dict(size=14), showactive=True, pad=dict(l=0, r=0, t=0, b=0))])
+        height=320, margin=dict(l=50, r=20, t=50, b=50), bargap=0.4,
+        xaxis=dict(showgrid=False, fixedrange=True),
+        yaxis=dict(range=[0, max(ys + [1]) * 1.22], gridcolor=GRID, zeroline=False, fixedrange=True,
+                   title=dict(text="Number of sites")),
+        annotations=[dict(xref="paper", yref="paper", x=0, y=1.02, xanchor="left", yanchor="bottom",
+                          showarrow=False, text=f"<b>{c['pct']:.1f}% of main sites covered</b>",
+                          font=dict(size=15, color=TEAL))])
     return dict(data=data, layout=layout)
 
 
-def fig_heatmap(perf, regions):
-    rows = ["All regions"] + regions
-    labels = [m[1] for m in METRICS]
-    z = [[num(perf[r]["metrics"][k]["mean"]) for k, _l, _c in METRICS] for r in rows]
-    flat = [v for row in z for v in row if v is not None]
-    zmin = max(0, math.floor(min(flat) / 5) * 5) if flat else 0
-    text = [[f"{v:.1f}" if v is not None else "" for v in row] for row in z]
-    data = [dict(type="heatmap", x=labels, y=rows, z=z, text=text, texttemplate="%{text}",
-                 zmin=zmin, zmax=100, xgap=3, ygap=3, showscale=True,
-                 colorscale=[[0, "#F5ECD7"], [0.5, "#8CC5BC"], [1, TEAL]],
-                 colorbar=dict(title=dict(text="Mean %"), thickness=12, len=0.6),
-                 hovertemplate="%{y}<br>%{x}: %{z:.1f}%<extra></extra>")]
-    layout = base_layout(height=max(420, 26 * len(rows) + 110), margin=dict(l=90, r=10, t=10, b=60),
-                         xaxis=dict(side="bottom", fixedrange=True),
-                         yaxis=dict(autorange="reversed", fixedrange=True, type="category"))
-    return dict(data=data, layout=layout)
-
-
-def fig_hake(perf, regions):
-    pts = [(r, perf[r]["paired"]) for r in regions
-           if perf[r]["paired"]["g"] is not None and perf[r]["paired"]["p"] is not None]
-    pts.sort(key=lambda kv: kv[1]["g"], reverse=True)
-    col = {"high": TEAL, "medium": AMBER, "low": CORAL}
-    xs = [r for r, _ in pts]
-    gs = [num(s["g"]) for _, s in pts]
-    data = [dict(type="bar", x=xs, y=gs, showlegend=False,
-                 marker=dict(color=[col[hake_category(s["g"])] for _, s in pts]),
-                 text=[f"{s['g']:.2f}{stars(s['p'])}" for _, s in pts], textposition="outside",
-                 cliponaxis=False,
-                 customdata=[[s["n"], num(s["pre"]), num(s["post"]), num(s["p"])] for _, s in pts],
-                 hovertemplate="%{x}<br>Hake's g = %{y:.2f}<br>Paired n = %{customdata[0]}"
-                               "<br>Pretest %{customdata[1]:.1f}% to posttest %{customdata[2]:.1f}%"
-                               "<br>Paired t-test p = %{customdata[3]:.4g}<extra></extra>")]
-    for name, c in (("High gain (g ≥ 0.7)", TEAL), ("Medium gain (0.3 ≤ g < 0.7)", AMBER), ("Low gain (g < 0.3)", CORAL)):
-        data.append(dict(type="bar", x=[None], y=[None], name=name, marker=dict(color=c), hoverinfo="skip"))
-    shapes, annotations = [], []
-    g_all = perf["All regions"]["paired"]["g"]
-    if g_all is not None:
-        shapes.append(dict(type="line", xref="paper", x0=0, x1=1, yref="y", y0=g_all, y1=g_all,
-                           line=dict(color=INK, width=1.5, dash="dash")))
-        annotations.append(dict(xref="paper", x=1, xanchor="right", yref="y", y=g_all, yanchor="bottom",
-                                text=f"All regions: g = {g_all:.2f}", showarrow=False,
-                                font=dict(size=12, color=INK)))
-    for y in (0.3, 0.7):
-        shapes.append(dict(type="line", xref="paper", x0=0, x1=1, yref="y", y0=y, y1=y,
-                           line=dict(color=SLATE, width=1, dash="dot")))
-    ymax = max([g for g in gs if g is not None] + [1.0])
-    layout = base_layout(height=430, barmode="overlay", margin=dict(l=60, r=24, t=30, b=100),
-                         xaxis=dict(type="category", showgrid=False, fixedrange=True),
-                         yaxis=dict(range=[min(0, min(gs) - 0.05) if gs else 0, ymax + 0.15],
-                                    gridcolor=GRID, zeroline=True, zerolinecolor=SLATE,
-                                    title=dict(text="Hake's normalized gain (g)")),
-                         legend=dict(orientation="h", x=0, y=-0.18, yanchor="top"),
-                         shapes=shapes, annotations=annotations, bargap=0.3)
-    return dict(data=data, layout=layout)
-
-
-def fig_coverage(cov, totals):
-    regions = list(cov.index)
-    pct = [num(v) for v in cov["pct"]]
-    data = [
-        dict(type="bar", name="Total main sites", x=regions, y=cov["main_total"].tolist(),
-             marker=dict(color=INK), yaxis="y",
-             hovertemplate="%{x}<br>Main sites: %{y}<extra></extra>"),
-        dict(type="bar", name="Main sites covered", x=regions, y=cov["covered"].tolist(),
-             marker=dict(color=TEAL), yaxis="y",
-             customdata=list(zip(cov["main_trained"].tolist(), cov["alt_covered"].tolist())),
-             hovertemplate="%{x}<br>Covered: %{y}<br>Trained at main: %{customdata[0]}"
-                           "<br>Via alternate: %{customdata[1]}<extra></extra>"),
-        dict(type="bar", name="Total alternate sites", x=regions, y=cov["alt_total"].tolist(),
-             marker=dict(color=AMBER), yaxis="y",
-             hovertemplate="%{x}<br>Alternate sites: %{y}<extra></extra>"),
-        dict(type="scatter", mode="markers+text", name="% coverage of main sites", x=regions, y=pct,
-             yaxis="y2", marker=dict(color=CORAL, size=11),
-             text=[f"{v:.0f}%" if v is not None else "" for v in pct], textposition="top center",
-             textfont=dict(size=12, color=CORAL), cliponaxis=False,
-             hovertemplate="%{x}<br>Coverage: %{y:.1f}%<extra></extra>"),
-    ]
-    layout = base_layout(
-        height=660, barmode="group", bargap=0.25, margin=dict(l=70, r=24, t=20, b=110),
-        xaxis=dict(type="category", showgrid=False, anchor="y", fixedrange=True),
-        yaxis=dict(domain=[0, 0.64], gridcolor=GRID, zeroline=False, title=dict(text="Number of sites")),
-        yaxis2=dict(domain=[0.74, 1], range=[0, 118], tickvals=[0, 50, 100], ticksuffix="%", anchor="x",
-                    gridcolor=GRID, zeroline=False, title=dict(text="Coverage")),
-        legend=dict(orientation="h", x=0, y=-0.14, yanchor="top"),
-        shapes=[dict(type="line", xref="paper", x0=0, x1=1, yref="y2", y0=totals["pct"], y1=totals["pct"],
-                     line=dict(color=CORAL, width=1, dash="dot"))],
-        annotations=[dict(xref="paper", x=1, xanchor="right", yref="y2", y=totals["pct"], yanchor="top",
-                          text=f"All regions: {totals['pct']:.1f}%", showarrow=False,
-                          font=dict(size=12, color=CORAL))])
-    return dict(data=data, layout=layout)
-
-
-def fig_composition(cov):
-    c = cov.sort_values("pct", ascending=True)
-    ylabels = [f"{r}  ({v:.0f}%)" for r, v in zip(c.index, c["pct"])]
+def fig_split(name, s, t):
+    cats = [pretty(name)] + ([] if name == ALL else [ALL])
+    rows = [s["c"]] + ([] if name == ALL else [t["c"]])
     series = [("Trained at main site", "main_trained", TEAL), ("Covered by alternate site", "alt_covered", BLUE),
-              ("Not covered", "neither", CORAL)]
-    data = [dict(type="bar", orientation="h", y=ylabels, x=c[col].tolist(), name=name,
-                 marker=dict(color=color), text=[str(v) if v else "" for v in c[col]],
-                 textposition="inside", insidetextanchor="middle", textfont=dict(color="white", size=12),
-                 hovertemplate="%{y}<br>" + name + ": %{x} main sites<extra></extra>")
-            for name, col, color in series]
-    layout = base_layout(height=max(420, 28 * len(c) + 110), barmode="stack", barnorm="percent", bargap=0.25,
-                         margin=dict(l=110, r=24, t=10, b=100),
-                         xaxis=dict(ticksuffix="%", gridcolor=GRID, zeroline=False, fixedrange=True),
-                         yaxis=dict(type="category", automargin=True, fixedrange=True),
-                         legend=dict(orientation="h", x=0, y=-0.12, yanchor="top"))
+              ("Neither trained", "neither", CORAL)]
+    data = []
+    for label, key, color in series:
+        vals = [r[key] for r in rows]
+        data.append(dict(type="bar", orientation="h", y=cats, x=vals, name=label, marker=dict(color=color),
+                         text=[str(v) if v else "" for v in vals], textposition="inside",
+                         insidetextanchor="middle", textfont=dict(color="white", size=14),
+                         hovertemplate="%{y}<br>" + label + ": %{x} main sites<extra></extra>"))
+    layout = base_layout(
+        height=320, barmode="stack", barnorm="percent", bargap=0.35,
+        margin=dict(l=10, r=20, t=20, b=100),
+        xaxis=dict(ticksuffix="%", range=[0, 100], gridcolor=GRID, zeroline=False, fixedrange=True),
+        yaxis=dict(type="category", autorange="reversed", automargin=True, fixedrange=True),
+        legend=dict(orientation="h", x=0, y=-0.25, yanchor="top"))
     return dict(data=data, layout=layout)
 
 
-def fig_table(cov, totals):
-    rows = list(cov.index) + ["All regions"]
-    def col(name, total):
-        return cov[name].astype(int).tolist() + [total]
-    pct = [f"{v:.1f}%" for v in cov["pct"]] + [f"{totals['pct']:.1f}%"]
-    cells = [rows, col("main_total", totals["main_total"]), col("main_trained", totals["main_trained"]),
-             col("alt_covered", totals["alt_covered"]), col("covered", totals["covered"]),
-             col("neither", totals["neither"]), col("alt_total", totals["alt_listed"]), pct]
-    last = len(rows) - 1
-    fill = [["#FFFFFF" if i != last else "#E8F1F1" for i in range(len(rows))]] * len(cells)
-    data = [dict(type="table", columnwidth=[1.1, 1, 1, 1.1, 1, 1, 1, 1.1],
-                 header=dict(values=["Region", "Main sites", "Trained at main", "Covered by alternate",
-                                     "Total covered", "Not covered", "Alternate sites", "% coverage"],
-                             fill=dict(color=INK), font=dict(color="white", size=13, family=FONT),
-                             align="center", height=40, line=dict(color=INK)),
-                 cells=dict(values=cells, fill=dict(color=fill), align="center", height=30,
-                            font=dict(size=13, color=INK, family=FONT), line=dict(color=GRID)))]
-    layout = base_layout(height=40 + 30 * len(rows) + 30, margin=dict(l=0, r=0, t=0, b=0))
+def fig_assess(name, s, t):
+    labels = [m[1] for m in METRICS]
+
+    def vals(v):
+        return [num(v["metrics"][k]["mean"]) for k, _l, _c in METRICS]
+
+    def bar(label, v, color, with_text):
+        ys = vals(v)
+        d = dict(type="bar", name=label, x=labels, y=ys, marker=dict(color=color),
+                 customdata=[[v["metrics"][k]["n"], num(v["metrics"][k]["sd"])] for k, _l, _c in METRICS],
+                 hovertemplate="%{x}<br>Mean: %{y:.1f}%<br>n = %{customdata[0]}"
+                               "<br>SD = %{customdata[1]:.1f}<extra>" + label + "</extra>")
+        if with_text:
+            d.update(text=[f"{y:.1f}%" if y is not None else "" for y in ys], textposition="outside",
+                     cliponaxis=False)
+        return d
+
+    data = [bar(pretty(name), s, TEAL, True)]
+    if name != ALL:
+        data.append(bar("All regions", t, "rgba(138,151,171,0.5)", True))
+    layout = base_layout(
+        height=420, barmode="group", bargap=0.3, bargroupgap=0.06, margin=dict(l=60, r=20, t=20, b=100),
+        xaxis=dict(showgrid=False, fixedrange=True),
+        yaxis=dict(range=[0, 114], ticksuffix="%", gridcolor=GRID, zeroline=False, fixedrange=True,
+                   title=dict(text="Mean score")),
+        legend=dict(orientation="h", x=0, y=-0.2, yanchor="top"))
+    return dict(data=data, layout=layout)
+
+
+def fig_hake(name, s, t):
+    g, ga = s["paired"]["g"], t["paired"]["g"]
+    data = []
+    if g is not None:
+        data.append(dict(type="bar", orientation="h", y=["g"], x=[num(g)], width=[0.36], name=pretty(name),
+                         marker=dict(color=CAT_COLOR[hake_category(g)]),
+                         hovertemplate="Hake's g = %{x:.2f}<extra>" + pretty(name) + "</extra>"))
+    if name != ALL and ga is not None:
+        data.append(dict(type="scatter", mode="markers", y=["g"], x=[num(ga)], name="All regions",
+                         marker=dict(symbol="diamond", size=15, color=INK, line=dict(color="white", width=1.5)),
+                         hovertemplate="Hake's g = %{x:.2f}<extra>All regions</extra>"))
+    xmin = min(0.0, (g if g is not None else 0) - 0.05)
+    bands = [(0.0, 0.3, "Low", "rgba(200,85,61,0.14)"), (0.3, 0.7, "Medium", "rgba(217,154,43,0.16)"),
+             (0.7, 1.0, "High", "rgba(14,124,123,0.14)")]
+    shapes = [dict(type="rect", xref="x", yref="paper", x0=a, x1=b, y0=0, y1=1, fillcolor=col,
+                   line=dict(width=0), layer="below") for a, b, _l, col in bands]
+    annotations = [dict(xref="x", yref="paper", x=(a + b) / 2, y=1.0, yanchor="bottom", showarrow=False,
+                        text=lab, font=dict(size=12, color="#5B6B82")) for a, b, lab, _c in bands]
+    if g is None:
+        annotations.append(dict(xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False,
+                                text="Hake's g not available", font=dict(size=14, color="#5B6B82")))
+    layout = base_layout(
+        height=200, margin=dict(l=10, r=14, t=34, b=76), shapes=shapes, annotations=annotations,
+        xaxis=dict(range=[xmin, 1.0], tickvals=[0, 0.3, 0.7, 1], gridcolor=GRID, zeroline=False,
+                   fixedrange=True),
+        yaxis=dict(type="category", showticklabels=False, showgrid=False, zeroline=False, fixedrange=True),
+        legend=dict(orientation="h", x=0, y=-0.6, yanchor="top"))
     return dict(data=data, layout=layout)
 
 
 # --------------------------------------------------------------------------- #
-# HTML
+# HTML shell
 # --------------------------------------------------------------------------- #
 TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -453,8 +361,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 __PLOTLY_TAG__
 <style>
   :root {
-    --ink:#16233B; --muted:#5B6B82; --line:#E3E8EE; --bg:#F5F7FA; --card:#FFFFFF;
-    --teal:#0E7C7B; --blue:#3F7CAC; --coral:#C8553D; --amber:#D99A2B;
+    --ink:#16233B; --muted:#5B6B82; --line:#E3E8EE; --bg:#F5F7FA; --card:#FFFFFF; --teal:#0E7C7B;
   }
   * { box-sizing: border-box; }
   html { scroll-behavior: smooth; }
@@ -466,32 +373,44 @@ __PLOTLY_TAG__
   header h1 { margin:0 0 8px; font-size:clamp(26px,4vw,40px); line-height:1.15; letter-spacing:-0.02em; font-weight:700; }
   header p { margin:0; max-width:62ch; color:#C9D3E3; font-size:16px; }
   header .stamp { margin-top:14px; font-size:13px; color:#98A7BF; }
-  nav { background:#fff; border-bottom:1px solid var(--line); position:sticky; top:0; z-index:5; }
-  nav .wrap { display:flex; gap:26px; overflow-x:auto; }
-  nav a { display:block; padding:14px 0; color:var(--muted); text-decoration:none; font-size:14px; font-weight:600;
-          white-space:nowrap; border-bottom:2px solid transparent; }
-  nav a:hover, nav a:focus-visible { color:var(--ink); border-bottom-color:var(--teal); outline:none; }
-  section { padding:44px 0 8px; }
-  section > .wrap > h2 { margin:0 0 6px; font-size:26px; letter-spacing:-0.01em; }
-  section > .wrap > .lede { margin:0 0 24px; color:var(--muted); max-width:70ch; }
-  .kpis { display:grid; grid-template-columns:repeat(5,1fr); gap:14px; margin-bottom:14px; }
+  .controls { background:#fff; border-bottom:1px solid var(--line); position:sticky; top:0; z-index:5; }
+  .controls .wrap { display:flex; align-items:center; gap:14px; padding-top:12px; padding-bottom:12px; flex-wrap:wrap; }
+  .controls label { font-weight:600; }
+  .controls select { font:inherit; font-size:16px; padding:8px 36px 8px 12px; min-width:200px; color:var(--ink);
+                     border:1px solid #B8C2D0; border-radius:6px; background:#fff; cursor:pointer; }
+  .controls select:focus-visible { outline:2px solid var(--teal); outline-offset:2px; }
+  .controls .hint { color:var(--muted); font-size:14px; }
+  section { padding:36px 0 4px; }
+  section h2 { margin:0 0 6px; font-size:26px; letter-spacing:-0.01em; }
+  section .lede { margin:0 0 22px; color:var(--muted); max-width:70ch; }
+  .view-title { margin:28px 0 0; font-size:34px; letter-spacing:-0.02em; }
+  .kpis { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-bottom:18px; }
   .kpi { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px 18px; border-top:4px solid var(--c); }
   .kpi .num { font-size:34px; font-weight:700; letter-spacing:-0.02em; line-height:1.1; }
   .kpi .lbl { font-weight:600; margin-top:4px; }
   .kpi .sub { color:var(--muted); font-size:13px; margin-top:4px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:20px 22px 12px; margin-bottom:18px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:20px 22px 12px; }
   .card h3 { margin:0 0 4px; font-size:18px; }
   .card .desc { margin:0 0 12px; color:var(--muted); font-size:14px; max-width:80ch; }
-  .two { display:grid; grid-template-columns:1.25fr 1fr; gap:18px; }
-  .two .card { margin-bottom:0; }
+  .two { display:grid; grid-template-columns:1fr 1fr; gap:18px; margin-bottom:18px; }
+  .perf { display:grid; grid-template-columns:1.2fr 1fr; gap:18px; }
   .chart { width:100%; }
   .scroll-x { overflow-x:auto; }
-  .explorer { min-width:760px; }
-  .notes { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:20px 24px; margin:44px 0 0; color:var(--muted); font-size:14px; }
+  .scroll-x .chart { min-width:420px; }
+  .stats-card { padding-bottom:6px; }
+  .big { font-size:52px; font-weight:700; letter-spacing:-0.03em; line-height:1.05; color:var(--c, var(--ink)); margin:6px 0 14px; }
+  .big span { display:block; font-size:14px; font-weight:400; letter-spacing:0; color:var(--muted); margin-top:4px; }
+  .big em { font-style:normal; color:var(--ink); font-weight:600; }
+  dl.stats { margin:0 0 10px; }
+  dl.stats > div { display:flex; justify-content:space-between; gap:14px; padding:7px 0; border-top:1px solid var(--line); font-size:14px; }
+  dl.stats dt { color:var(--muted); }
+  dl.stats dd { margin:0; font-weight:600; text-align:right; }
+  .gauge-title { margin:14px 0 0; font-size:14px; font-weight:600; border-top:1px solid var(--line); padding-top:12px; }
+  .notes { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:20px 24px; margin:40px 0 0; color:var(--muted); font-size:14px; }
   .notes h2 { margin:0 0 8px; font-size:18px; color:var(--ink); }
   .notes p { margin:0 0 10px; max-width:90ch; }
   footer { padding:28px 0 48px; color:var(--muted); font-size:13px; }
-  @media (max-width:980px) { .kpis { grid-template-columns:repeat(2,1fr); } .two { grid-template-columns:1fr; } .two .card { margin-bottom:18px; } }
+  @media (max-width:980px) { .kpis { grid-template-columns:repeat(2,1fr); } .two, .perf { grid-template-columns:1fr; } }
   @media (max-width:480px) { .wrap { padding:0 14px; } .kpis { grid-template-columns:1fr; } .card { padding:14px 12px 8px; } }
 </style>
 </head>
@@ -499,34 +418,37 @@ __PLOTLY_TAG__
 <header>
   <div class="wrap">
     <h1>NPOC initial training: coverage and performance</h1>
-    <p>How many main sites are covered by trained staff, how participants performed, and where coverage still needs attention, by region.</p>
+    <p>How many main sites are covered by trained staff and how participants performed. Choose a region to see its figures; All regions shows the overall totals.</p>
     <div class="stamp">Aggregated figures only. Generated __ASOF__.</div>
   </div>
 </header>
-<nav aria-label="Sections">
-  <div class="wrap">
-    <a href="#summary">Summary</a>
-    <a href="#performance">Training performance</a>
-    <a href="#coverage">Regional coverage</a>
-    <a href="#notes">Notes and definitions</a>
-  </div>
-</nav>
 
-<section id="summary">
+<div class="controls">
   <div class="wrap">
-    <h2>Summary</h2>
+    <label for="region-select">Region</label>
+    <select id="region-select" aria-controls="view">__OPTIONS__</select>
+    <span class="hint">Everything below updates with this choice.</span>
+  </div>
+</div>
+
+<main id="view">
+<div class="wrap"><h2 class="view-title" id="view-title">All regions</h2></div>
+
+<section id="coverage">
+  <div class="wrap">
+    <h2>Training coverage</h2>
     <p class="lede">A main site counts as covered when its own staff completed training, or when an alternate site assigned to it did.</p>
-    <div class="kpis">__KPIS__</div>
+    <div class="kpis" id="kpis" aria-live="polite">__KPIS__</div>
     <div class="two">
       <div class="card">
-        <h3>How the __MAIN_TOTAL__ main sites are covered</h3>
-        <p class="desc">Each main site falls in exactly one group.</p>
-        <div id="fig-status" class="chart"></div>
+        <h3>Main, covered and alternate sites</h3>
+        <p class="desc">Total main sites, how many are covered, and how many alternate sites are listed.</p>
+        <div id="fig-sites" class="chart"></div>
       </div>
       <div class="card">
-        <h3>Incomplete training</h3>
-        <p class="desc">Participants who finished only one of the two training components.</p>
-        <div id="fig-incomplete" class="chart"></div>
+        <h3>How main sites are covered</h3>
+        <p class="desc">Share of main sites by coverage route. The all-regions bar is shown for comparison.</p>
+        <div id="fig-split" class="chart"></div>
       </div>
     </div>
   </div>
@@ -535,45 +457,22 @@ __PLOTLY_TAG__
 <section id="performance">
   <div class="wrap">
     <h2>Training performance</h2>
-    <p class="lede">Average scores for the pretest, posttest, competency assessment and Pluslife assessment. Pick a region to compare it with all regions and to see its pretest-to-posttest statistics.</p>
-    <div class="card">
-      <h3>Regional explorer</h3>
-      <p class="desc">Use the menu at the top left of the chart. Grey bars show the all-regions average for comparison. Hover a bar for the number of records and the standard deviation.</p>
-      <div class="scroll-x"><div id="fig-explorer" class="chart explorer"></div></div>
-    </div>
-    <div class="card">
-      <h3>All regions at a glance</h3>
-      <p class="desc">Mean score (%) per assessment. Darker cells are higher.</p>
-      <div id="fig-heatmap" class="chart"></div>
-    </div>
-    <div class="card">
-      <h3>Learning gain by region (Hake's g)</h3>
-      <p class="desc">Share of the possible improvement that participants achieved between pretest and posttest. Stars show the paired t-test result: * p &lt; 0.05, ** p &lt; 0.01, *** p &lt; 0.001.</p>
-      <div id="fig-hake" class="chart"></div>
+    <p class="lede">Average scores for the pretest, posttest, competency assessment and Pluslife assessment, with the pretest-to-posttest statistics.</p>
+    <div class="perf">
+      <div class="card">
+        <h3>Assessment averages</h3>
+        <p class="desc">Grey bars show the all-regions average. Hover a bar for the number of records and the standard deviation.</p>
+        <div class="scroll-x"><div id="fig-assess" class="chart"></div></div>
+      </div>
+      <div class="card stats-card">
+        <div id="stats" aria-live="polite">__STATS__</div>
+        <p class="gauge-title">Where this gain falls (Hake's g)</p>
+        <div id="fig-hake" class="chart"></div>
+      </div>
     </div>
   </div>
 </section>
-
-<section id="coverage">
-  <div class="wrap">
-    <h2>Regional coverage</h2>
-    <p class="lede">Coverage is the share of a region's main sites that are trained at the main site or through an alternate.</p>
-    <div class="card">
-      <h3>Main sites, covered sites and alternate sites</h3>
-      <p class="desc">Bars show counts. The dots above show each region's percent coverage.</p>
-      <div id="fig-coverage" class="chart"></div>
-    </div>
-    <div class="card">
-      <h3>How each region's coverage was reached</h3>
-      <p class="desc">Regions are sorted from lowest coverage (top) to highest. Percent coverage is in brackets after the region name.</p>
-      <div id="fig-composition" class="chart"></div>
-    </div>
-    <div class="card">
-      <h3>Coverage table</h3>
-      <div id="fig-table" class="chart"></div>
-    </div>
-  </div>
-</section>
+</main>
 
 <section id="notes">
   <div class="wrap">
@@ -585,25 +484,44 @@ __PLOTLY_TAG__
 </section>
 <footer><div class="wrap">Built with Python (pandas, SciPy) and Plotly.</div></footer>
 
-<script type="application/json" id="figure-specs">__SPECS__</script>
+<script type="application/json" id="view-data">__SPECS__</script>
 <script>
 (function () {
-  var specs = JSON.parse(document.getElementById("figure-specs").textContent);
-  var config = { responsive: true, displaylogo: false, displayModeBar: "hover",
-                 modeBarButtonsToRemove: ["lasso2d", "select2d", "autoScale2d"] };
-  var ids = { "fig-status": "status", "fig-incomplete": "incomplete", "fig-explorer": "explorer",
-              "fig-heatmap": "heatmap", "fig-hake": "hake", "fig-coverage": "coverage",
-              "fig-composition": "composition", "fig-table": "table" };
-  if (typeof Plotly === "undefined") {
-    document.querySelectorAll(".chart").forEach(function (el) {
-      el.innerHTML = "<p style='color:#C8553D'>Charts could not load. Check your internet connection (plotly.js is loaded from a CDN) or rebuild with --embed-js.</p>";
+  var payload = JSON.parse(document.getElementById("view-data").textContent);
+  var sel = document.getElementById("region-select");
+  var charts = { sites: "fig-sites", split: "fig-split", assess: "fig-assess", hake: "fig-hake" };
+  var config = { responsive: true, displaylogo: false, displayModeBar: false };
+
+  function render(key) {
+    var v = payload.views[key];
+    if (!v) { return; }
+    document.getElementById("view-title").textContent = v.title;
+    document.getElementById("kpis").innerHTML = v.kpis;
+    document.getElementById("stats").innerHTML = v.stats;
+    if (typeof Plotly === "undefined") {
+      document.querySelectorAll(".chart").forEach(function (el) {
+        el.innerHTML = "<p style='color:#C8553D'>Charts could not load. Check your internet connection (plotly.js is loaded from a CDN) or rebuild with --embed-js.</p>";
+      });
+      return;
+    }
+    Object.keys(charts).forEach(function (k) {
+      var s = v.figs[k];
+      Plotly.react(charts[k], s.data, s.layout, config);
     });
-    return;
   }
-  Object.keys(ids).forEach(function (domId) {
-    var s = specs[ids[domId]];
-    Plotly.newPlot(domId, s.data, s.layout, config);
+
+  sel.addEventListener("change", function () {
+    render(sel.value);
+    try { history.replaceState(null, "", "#" + encodeURIComponent(sel.value)); } catch (e) {}
   });
+
+  var start = "ALL";
+  try {
+    var h = decodeURIComponent(location.hash.replace(/^#/, ""));
+    if (h && payload.views[h]) { start = h; }
+  } catch (e) {}
+  sel.value = start;
+  render(start);
 })();
 </script>
 </body>
@@ -611,43 +529,12 @@ __PLOTLY_TAG__
 """
 
 
-def kpi(num_, label, sub, color):
-    return (f'<div class="kpi" style="--c:{color}"><div class="num">{num_}</div>'
-            f'<div class="lbl">{label}</div><div class="sub">{sub}</div></div>')
-
-
-def build_html(specs, t, inc_ct, n_zero_pre, perf, asof, plotly_tag):
-    inc_main = inc_ct[("MAIN", "online")] + inc_ct[("MAIN", "f2f")]
-    inc_alt = inc_ct[("ALTERNATE", "online")] + inc_ct[("ALTERNATE", "f2f")]
-    inc_online = inc_ct[("MAIN", "online")] + inc_ct[("ALTERNATE", "online")]
-    inc_f2f = inc_ct[("MAIN", "f2f")] + inc_ct[("ALTERNATE", "f2f")]
-    kpis = "".join([
-        kpi(f"{t['covered']}", "Sites trained (main + alternate)",
-            f"{t['pct']:.1f}% of {t['main_total']} main sites are covered", TEAL),
-        kpi(f"{t['main_trained']}", "Trained at the main site",
-            f"{100 * t['main_trained'] / t['main_total']:.1f}% of main sites", INK),
-        kpi(f"{t['alt_covered']}", "Covered by an alternate",
-            f"{t['alt_trained']} of {t['alt_listed']} listed alternates trained", BLUE),
-        kpi(f"{t['neither']}", "Neither trained",
-            f"No trained main or alternate staff ({t['neither_incomplete']} have partial training)", CORAL),
-        kpi(f"{t['incomplete']}", "Incomplete training",
-            f"{inc_online} missing online, {inc_f2f} missing face-to-face ({inc_main} main, {inc_alt} alternate)", AMBER),
-    ])
-    g = perf["All regions"]["paired"]
-    if g["p"] is not None:
-        stat_line = (f"Across all regions, {g['n']} paired records show a mean gain of {g['diff']:+.1f} points "
-                     f"(pretest {g['pre']:.1f}% to posttest {g['post']:.1f}%), paired t({g['df']}) = {g['t']:.2f}, "
-                     f"{p_text(g['p'])}, Cohen's dz = {g['dz']:.2f}, Hake's g = {g['g']:.2f}.")
-    else:
-        stat_line = ""
-    zero_note = (f"{n_zero_pre} pretest scores of exactly 0% were treated as not taken and left out of every "
-                 f"pretest average, t-test and gain calculation, because a pretest of 0 paired with a near-perfect "
-                 f"posttest would inflate the gain. Set ZERO_PRETEST_IS_MISSING = False in the build script to include them."
-                 if ZERO_PRETEST_IS_MISSING and n_zero_pre else "")
-    notes = "".join(f"<p>{x}</p>" for x in [
+def build_html(views, order, t, n_zero_pre, asof, plotly_tag):
+    options = "".join(f'<option value="{k}">{views[k]["title"]}</option>' for k in order)
+    notes_list = [
         "<b>Main site covered.</b> A main site is covered when the main site itself is trained, or when it is not "
         "trained but at least one alternate site assigned to it is. Percent coverage = covered main sites divided by total main sites.",
-        f"<b>Alternate sites.</b> {t['alt_listed']} alternate sites are listed; {t['alt_trained']} are trained. "
+        f"<b>Alternate sites.</b> Across all regions {t['alt_listed']} alternate sites are listed and {t['alt_trained']} are trained. "
         f"{t['alt_trained'] - t['alt_covered']} trained alternates are not counted as coverage because their main site was already trained or another alternate already covered it.",
         "<b>Incomplete training.</b> A participant trained in only one of the online and face-to-face components. "
         "Main sites in this group are counted as neither trained.",
@@ -657,14 +544,20 @@ def build_html(specs, t, inc_ct, n_zero_pre, perf, asof, plotly_tag):
         f"Not reported when a region has fewer than {MIN_N} paired records. Cohen's dz is the mean gain divided by the standard deviation of the gains.",
         "<b>Hake's normalized gain.</b> g = (mean posttest − mean pretest) / (100 − mean pretest), computed on group means. "
         "Common reading: g &lt; 0.3 low, 0.3 to &lt; 0.7 medium, ≥ 0.7 high. Because pretest scores are already high, small absolute gains can still give a high g.",
-        zero_note, stat_line,
+        (f"<b>Zero pretests.</b> {n_zero_pre} pretest scores of exactly 0% were treated as not taken and left out of every "
+         f"pretest average, t-test and gain calculation, because a pretest of 0 paired with a near-perfect "
+         f"posttest would inflate the gain. Set ZERO_PRETEST_IS_MISSING = False in the build script to include them."
+         if ZERO_PRETEST_IS_MISSING and n_zero_pre else ""),
         "<b>Privacy.</b> This page contains only aggregated counts and statistics. No facility names, participant names, e-mail addresses or individual scores are included.",
-    ] if x)
-    specs_json = json.dumps(specs, allow_nan=False, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
-    html = (TEMPLATE.replace("__PLOTLY_TAG__", plotly_tag).replace("__ASOF__", asof)
-            .replace("__KPIS__", kpis).replace("__MAIN_TOTAL__", str(t["main_total"]))
-            .replace("__NOTES__", notes).replace("__SPECS__", specs_json))
-    return html
+    ]
+    notes = "".join(f"<p>{x}</p>" for x in notes_list if x)
+    payload = dict(views={k: dict(title=v["title"], kpis=v["kpis"], stats=v["stats"], figs=v["figs"])
+                          for k, v in views.items()})
+    specs_json = json.dumps(payload, allow_nan=False, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+    return (TEMPLATE.replace("__PLOTLY_TAG__", plotly_tag).replace("__ASOF__", asof)
+            .replace("__OPTIONS__", options).replace("__KPIS__", views["ALL"]["kpis"])
+            .replace("__STATS__", views["ALL"]["stats"]).replace("__NOTES__", notes)
+            .replace("__SPECS__", specs_json))
 
 
 def privacy_check(html, df):
@@ -696,13 +589,21 @@ def main():
     args = ap.parse_args()
 
     df, n_zero_pre = load(args.csv)
-    cov, totals, inc_ct, regions = coverage(df)
-    perf = performance(df, regions)
+    check_helper_status(df)
+    regions = sorted(df["REGION"].unique(), key=region_sort_key)
 
-    specs = dict(status=fig_status_bar(totals), incomplete=fig_incomplete(inc_ct),
-                 explorer=fig_explorer(perf, regions), heatmap=fig_heatmap(perf, regions),
-                 hake=fig_hake(perf, regions), coverage=fig_coverage(cov, totals),
-                 composition=fig_composition(cov), table=fig_table(cov, totals))
+    total = summarize(df)
+    summaries = {"ALL": (ALL, total)}
+    for r in regions:
+        summaries[r] = (r, summarize(df[df["REGION"] == r]))
+
+    views, order = {}, ["ALL"] + regions
+    for key in order:
+        name, s = summaries[key]
+        views[key] = dict(
+            title=pretty(name), kpis=kpis_html(name, s), stats=stats_html(name, s, total),
+            figs=dict(sites=fig_sites(name, s), split=fig_split(name, s, total),
+                      assess=fig_assess(name, s, total), hake=fig_hake(name, s, total)))
 
     plotly_tag = f'<script src="{PLOTLYJS_CDN}" charset="utf-8"></script>'
     if args.embed_js:
@@ -712,15 +613,15 @@ def main():
         except ImportError:
             print("plotly not installed; falling back to the CDN script tag.", file=sys.stderr)
 
-    html = build_html(specs, totals, inc_ct, n_zero_pre, perf, args.asof, plotly_tag)
+    html = build_html(views, order, total["c"], n_zero_pre, args.asof, plotly_tag)
     privacy_check(html, df)
     Path(args.output).write_text(html, encoding="utf-8")
 
-    g = perf["All regions"]["paired"]
-    print(f"Wrote {args.output} ({len(html) / 1024:.0f} KB)")
-    print(f"Main sites {totals['main_total']}: main trained {totals['main_trained']}, via alternate "
-          f"{totals['alt_covered']}, neither {totals['neither']} -> coverage {totals['pct']:.1f}%")
-    print(f"Incomplete: {totals['incomplete']} | paired n={g['n']} g={g['g']:.2f} p={g['p']}")
+    c, g = total["c"], total["paired"]
+    print(f"Wrote {args.output} ({len(html) / 1024:.0f} KB), {len(order)} dropdown views")
+    print(f"All regions: {c['main_total']} main sites, main trained {c['main_trained']}, via alternate "
+          f"{c['alt_covered']}, neither {c['neither']} -> coverage {c['pct']:.1f}%")
+    print(f"Incomplete: {c['incomplete']} | paired n={g['n']} g={g['g']:.2f} p={g['p']}")
 
 
 if __name__ == "__main__":
