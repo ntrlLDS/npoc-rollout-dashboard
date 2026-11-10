@@ -1,2 +1,78 @@
-# npoc-rollout-dashboard
-Philippine TB NPOC-NAAT initial training rollout for implementing laboratory staff 
+# NPOC Initial Training Dashboard
+
+An interactive dashboard showing coverage and performance for the initial NPOC (Pluslife) training, by region. Pick a region from the dropdown and the whole page updates. **All regions** is the default view and shows the overall figures.
+
+**Live dashboard:** `https://ntrllds.github.io/npoc-rollout-dashboard/`
+
+## What the dashboard shows
+
+For the selected region (or all regions):
+
+- **Training coverage.** Total main sites, sites trained (main + alternate) with percent coverage, sites trained at the main site, sites covered by an alternate, sites with neither trained, and incomplete training (missing the online or the face-to-face component). Charts show main, covered and alternate sites, and how coverage was reached.
+- **Assessment averages.** Mean pretest, posttest, competency assessment and Pluslife assessment scores, compared with the all-regions average.
+- **Pretest-to-posttest statistics.** Paired t-test, Cohen's dz, and Hake's normalized gain (g), with a gauge showing whether the gain is low, medium or high.
+
+A region can be linked directly by adding its code to the address, for example `.../#IV`.
+
+## Privacy
+
+The published page contains **only aggregated numbers**: counts, regional means and test statistics. It does not contain facility names, participant names, email addresses or individual scores.
+
+- Do **not** commit the source CSV to this repository.
+- The build script scans the finished HTML for any facility, participant or email value from the CSV and stops without writing the file if it finds one.
+- This repository's history is public, so never commit a version of the data or a dashboard that contains identifying information. Deleting a file later does not remove it from the history.
+
+If you use `git`, add this to a file named `.gitignore` so the data cannot be committed by accident:
+
+```
+*.csv
+```
+
+## Files
+
+| File | Purpose |
+| --- | --- |
+| `index.html` | The dashboard (the file GitHub Pages serves). |
+| `build_npoc_dashboard.py` | Script that reads the training CSV and writes the dashboard. Contains no data. |
+| `README.md` | This file. |
+
+## Rebuilding the dashboard from a new CSV
+
+Requirements: Python 3.9 or newer, with `pandas`, `numpy` and `scipy`.
+
+```
+pip install pandas numpy scipy
+python build_npoc_dashboard.py path/to/training_monitoring.csv -o index.html --asof "10 Nov 2026"
+```
+
+Options:
+
+| Option | Meaning |
+| --- | --- |
+| `-o`, `--output` | Output file name. Default `npoc_dashboard.html`. |
+| `--asof` | Date text shown in the page header. Defaults to today. |
+| `--embed-js` | Embed plotly.js in the HTML so the page works offline. Needs `pip install plotly`. Without it, plotly.js loads from a CDN and the page needs internet access. |
+
+The script expects these columns in the CSV: `REGION`, `FACILITY`, `SELECTION`, `ALTERNATE_FOR`, `OVERALL_STATUS`, `HELPER_STATUS`, `PRETEST_PERCENT`, `POSTTEST_PERCENT`, `COMPETENCY_PERCENT`, `PLUSLIFE_PERCENT`. Privacy checking also reads `PARTICIPANT`, `PARTICIPANT_HELPER1`, `PARTICIPANT_HELPER2` and `EMAIL` when present.
+
+After building, upload the new `index.html` to the repository to replace the old one. GitHub Pages refreshes within a couple of minutes.
+
+### Settings in the script
+
+Near the top of `build_npoc_dashboard.py`:
+
+- `ZERO_PRETEST_IS_MISSING` (default `True`). Pretest scores of exactly 0% are treated as "not taken" and excluded, because a 0 paired with a near-perfect posttest would inflate the gain. Set to `False` to include them.
+- `MIN_N` (default `5`). The paired t-test is not reported for a region with fewer paired records than this.
+
+## Definitions
+
+- **Main site covered.** A main site is covered when the main site itself completed training, or when it did not but at least one alternate site assigned to it did. Percent coverage is covered main sites divided by total main sites.
+- **Incomplete training.** A participant who completed only one of the two training components (online or face-to-face). Main sites in this group count as "neither trained".
+- **Averages.** Each average uses every valid score for that assessment, so the number of records can differ between assessments. Entries marked not found or no score are excluded.
+- **Paired t-test.** Two-tailed, pretest versus posttest, using only records that have both scores.
+- **Cohen's dz.** The mean gain divided by the standard deviation of the gains.
+- **Hake's normalized gain (g).** g = (mean posttest − mean pretest) / (100 − mean pretest), calculated on group means. A common reading is below 0.3 low, 0.3 to below 0.7 medium, and 0.7 or above high. Because pretest scores are already high, small absolute gains can still produce a high g.
+
+## Built with
+
+Python (pandas, NumPy, SciPy) for the data processing and statistics, and [Plotly](https://plotly.com/javascript/) for the interactive charts.
